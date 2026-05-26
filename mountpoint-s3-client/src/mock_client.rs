@@ -1262,6 +1262,16 @@ impl MockPutObjectRequest {
         mut self,
         parts: Vec<MockObjectPartAttributes>,
     ) -> ObjectClientResult<PutObjectResult, PutObjectError, MockClientError> {
+        // Mirror S3: CRC64NVME on a multipart upload requires full-object mode.
+        if self.params.trailing_checksums == PutObjectTrailingChecksums::Enabled
+            && matches!(self.params.checksum_algorithm, ChecksumAlgorithm::Crc64nvme)
+            && self.params.full_object_checksum.is_none()
+        {
+            return mock_client_error(
+                "CRC64NVME requires full-object checksum mode (set full_object_checksum on PutObjectParams)",
+            );
+        }
+
         let buffer = std::mem::take(&mut self.buffer);
         let mut object: MockObject = buffer.into();
         object.set_storage_class(self.params.storage_class.clone());
@@ -1270,7 +1280,17 @@ impl MockPutObjectRequest {
         // For S3 Standard, part attributes are only available when additional checksums are used
         if self.params.trailing_checksums == PutObjectTrailingChecksums::Enabled {
             let algorithm = self.params.checksum_algorithm.clone();
-            let whole_obj_checksum = compute_whole_object_checksum(&algorithm, &parts);
+            let whole_obj_checksum = if let Some(handle) = self.params.full_object_checksum.clone() {
+                // Full-object mode: read the base64 value the caller wrote into the handle.
+                let value = handle.peek_base64().ok_or_else(|| {
+                    ObjectClientError::ClientError(MockClientError(
+                        "full_object_checksum handle was not populated before upload completed".into(),
+                    ))
+                })?;
+                checksum_for_algorithm(&algorithm, Some(value))
+            } else {
+                compute_whole_object_checksum(&algorithm, &parts)
+            };
             object.set_checksum(whole_obj_checksum);
             object.parts = Some(MockObjectParts::Parts {
                 algorithm,
@@ -1289,6 +1309,7 @@ impl MockPutObjectRequest {
         })
     }
 }
+
 
 /// Place a base64 part checksum into the field of `Checksum` corresponding to `algorithm`.
 fn checksum_for_algorithm(algorithm: &ChecksumAlgorithm, value: Option<String>) -> Checksum {
@@ -2201,6 +2222,56 @@ mod tests {
         assert_eq!(
             stored_object.checksum, expected_obj_checksum,
             "stored object checksum should equal expected checksum",
+        );
+    }
+
+    #[tokio::test]
+    async fn crc64nvme_without_full_object_handle_is_rejected() {
+        let client = MockClient::config().bucket("test_bucket").part_size(1024).build();
+        let params = PutObjectParams::new()
+            .trailing_checksums(PutObjectTrailingChecksums::Enabled)
+            .checksum_algorithm(ChecksumAlgorithm::Crc64nvme);
+        let mut request = client
+            .put_object("test_bucket", "key_no_handle", &params)
+            .await
+            .unwrap();
+        request.write(&[0u8; 1024]).await.unwrap();
+        let result = request.complete().await;
+        assert!(
+            matches!(result, Err(ObjectClientError::ClientError(MockClientError(ref msg))) if msg.contains("CRC64NVME requires full-object")),
+            "CRC64NVME without a full-object handle should be rejected, got: {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn crc64nvme_with_full_object_handle_lands_on_object() {
+        use crate::types::FullObjectChecksumHandle;
+
+        let client = MockClient::config().bucket("test_bucket").part_size(1024).build();
+        let handle = FullObjectChecksumHandle::new();
+        let params = PutObjectParams::new()
+            .trailing_checksums(PutObjectTrailingChecksums::Enabled)
+            .checksum_algorithm(ChecksumAlgorithm::Crc64nvme)
+            .full_object_checksum(handle.clone());
+        let mut request = client
+            .put_object("test_bucket", "key_full_obj", &params)
+            .await
+            .unwrap();
+        request.write(&[0u8; 2048]).await.unwrap();
+        // Populate the handle with the base64 the CRT would receive from our callback.
+        handle.set(b"ZHVtbXk=".to_vec()); // base64 of "dummy"
+        request.complete().await.unwrap();
+
+        let objects = client.objects.read().unwrap();
+        let stored = objects.get("key_full_obj").expect("object should exist");
+        assert_eq!(
+            stored.checksum.checksum_crc64nvme.as_deref(),
+            Some("ZHVtbXk="),
+            "full-object CRC64NVME should be the value the caller set on the handle",
+        );
+        assert!(
+            stored.checksum.checksum_crc32c.is_none(),
+            "no other algorithm slots should be populated",
         );
     }
 

@@ -20,7 +20,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::prelude::OsStrExt;
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Waker;
 use std::time::Duration;
 
@@ -1638,10 +1638,52 @@ pub fn init_signing_config(
 }
 
 /// The checksum configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct ChecksumConfig {
     /// The struct we can pass into the CRT's functions.
     inner: aws_s3_checksum_config,
+    /// State kept alive for the duration of the request when full-object mode is in use.
+    /// The CRT reads `inner.user_data` as a pointer to the `OnceLock<Vec<u8>>` inside this Arc,
+    /// so the Arc must outlive `inner`. Not read directly — its address is what matters.
+    #[allow(dead_code)]
+    full_object_state: Option<Arc<OnceLock<Vec<u8>>>>,
+}
+
+/// Handle the caller uses to provide the full-object checksum for a multipart upload after
+/// streaming finishes but before `CompleteMultipartUpload` is sent.
+///
+/// Created via [`ChecksumConfig::with_full_object_handle`] / [`ChecksumConfig::trailing_with_full_object`].
+#[derive(Debug, Clone)]
+pub struct FullObjectChecksumHandle {
+    state: Arc<OnceLock<Vec<u8>>>,
+}
+
+impl FullObjectChecksumHandle {
+    /// Create a fresh, unpopulated handle. The caller can clone this handle as needed; setting
+    /// the checksum once populates the value visible to all clones.
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Provide the base64-encoded full-object checksum the CRT should send.
+    /// Must be called before the CRT invokes `CompleteMultipartUpload`. Subsequent calls are ignored.
+    pub fn set(&self, base64: Vec<u8>) {
+        let _ = self.state.set(base64);
+    }
+
+    /// Read the base64 value the caller has written, if any. Primarily for non-CRT consumers
+    /// (e.g. the mock client) that need to inspect what would be sent to S3.
+    pub fn peek_base64(&self) -> Option<String> {
+        self.state.get().and_then(|bytes| std::str::from_utf8(bytes).ok().map(str::to_owned))
+    }
+}
+
+impl Default for FullObjectChecksumHandle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChecksumConfig {
@@ -1653,6 +1695,7 @@ impl ChecksumConfig {
                 checksum_algorithm: algorithm.to_aws_s3_checksum_algorithm(),
                 ..Default::default()
             },
+            full_object_state: None,
         }
     }
 
@@ -1664,6 +1707,44 @@ impl ChecksumConfig {
                 checksum_algorithm: algorithm.to_aws_s3_checksum_algorithm(),
                 ..Default::default()
             },
+            full_object_state: None,
+        }
+    }
+
+    /// Create a [ChecksumConfig] that uses S3's "full-object" checksum mode for multipart uploads.
+    /// Per-part trailing checksums are still sent (for the CRT's upload review), but the object-level
+    /// checksum sent on `CompleteMultipartUpload` is the value the caller writes into the returned
+    /// [`FullObjectChecksumHandle`].
+    pub fn trailing_with_full_object(algorithm: &ChecksumAlgorithm) -> (Self, FullObjectChecksumHandle) {
+        let state = Arc::new(OnceLock::new());
+        let user_data = Arc::as_ptr(&state) as *mut libc::c_void;
+        let config = Self {
+            inner: aws_s3_checksum_config {
+                location: aws_s3_checksum_location::AWS_SCL_TRAILER,
+                checksum_algorithm: algorithm.to_aws_s3_checksum_algorithm(),
+                full_object_checksum_callback: Some(full_object_checksum_shim),
+                user_data,
+                ..Default::default()
+            },
+            full_object_state: Some(Arc::clone(&state)),
+        };
+        let handle = FullObjectChecksumHandle { state };
+        (config, handle)
+    }
+
+    /// Variant of [`Self::trailing_with_full_object`] that reuses an existing handle.
+    pub fn with_full_object_handle(algorithm: &ChecksumAlgorithm, handle: FullObjectChecksumHandle) -> Self {
+        let state = handle.state;
+        let user_data = Arc::as_ptr(&state) as *mut libc::c_void;
+        Self {
+            inner: aws_s3_checksum_config {
+                location: aws_s3_checksum_location::AWS_SCL_TRAILER,
+                checksum_algorithm: algorithm.to_aws_s3_checksum_algorithm(),
+                full_object_checksum_callback: Some(full_object_checksum_shim),
+                user_data,
+                ..Default::default()
+            },
+            full_object_state: Some(state),
         }
     }
 
@@ -1671,6 +1752,24 @@ impl ChecksumConfig {
     pub(crate) fn to_inner_ptr(&self) -> *const aws_s3_checksum_config {
         &self.inner
     }
+}
+
+/// SAFETY: Don't call this function directly, only called by the CRT as the full-object checksum
+/// callback. `user_data` must be the `Arc::as_ptr` of an `OnceLock<Vec<u8>>` kept alive by the
+/// owning [`ChecksumConfig`].
+unsafe extern "C" fn full_object_checksum_shim(
+    _meta_request: *mut aws_s3_meta_request,
+    user_data: *mut libc::c_void,
+) -> *mut aws_string {
+    // SAFETY: see function-level safety contract.
+    let state = unsafe { &*(user_data as *const OnceLock<Vec<u8>>) };
+    let Some(bytes) = state.get() else {
+        // Caller didn't populate the handle in time. Returning NULL signals an error to the CRT.
+        return std::ptr::null_mut();
+    };
+    // SAFETY: aws_default_allocator returns a non-null allocator; aws_string_new_from_array copies
+    // the bytes and returns a heap-allocated aws_string for the CRT to consume and destroy.
+    unsafe { aws_string_new_from_array(aws_default_allocator(), bytes.as_ptr(), bytes.len()) }
 }
 
 /// Checksum algorithm.

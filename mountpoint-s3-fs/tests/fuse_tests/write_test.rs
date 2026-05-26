@@ -1466,7 +1466,6 @@ fn write_checksums_test(
     let (object_checksum, part_checksums) = test_session.client().get_object_checksums(KEY).unwrap();
     match algorithm {
         Some(algo) => {
-            // We should get the correct checksum on the whole object or on the parts.
             let extract: fn(&Checksum) -> Option<&String> = match algo {
                 ChecksumAlgorithm::Crc32c => |c| c.checksum_crc32c.as_ref(),
                 ChecksumAlgorithm::Crc64nvme => |c| c.checksum_crc64nvme.as_ref(),
@@ -1480,10 +1479,20 @@ fn write_checksums_test(
                 && part_checksums
                     .iter()
                     .all(|checksum| checksum.as_ref().is_some_and(|c| extract(c).is_some()));
-            assert!(
-                object_has_checksum || parts_have_checksum,
-                "{algo} should be present on the object or its parts"
-            );
+            // CRC64NVME on multipart must be a FULL_OBJECT checksum (S3 doesn't support
+            // composite for CRC64NVME), so the value must end up on the object itself, not
+            // just on the parts. Other algorithms can land on either.
+            if matches!(algo, ChecksumAlgorithm::Crc64nvme) {
+                assert!(
+                    object_has_checksum,
+                    "CRC64NVME must be reported as a full-object checksum on the object"
+                );
+            } else {
+                assert!(
+                    object_has_checksum || parts_have_checksum,
+                    "{algo} should be present on the object or its parts"
+                );
+            }
         }
         None => {
             // If no checksum was sent with the PutObject request, S3 automatically uses CRC-64NVME.

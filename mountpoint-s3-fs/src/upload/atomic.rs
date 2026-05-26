@@ -1,9 +1,10 @@
 use std::fmt::Debug;
 
-use mountpoint_s3_client::checksums::{Crc32c, crc32c_from_base64, crc64nvme, crc64nvme_from_base64};
+use mountpoint_s3_client::checksums::{Crc32c, crc32c_from_base64, crc64nvme, crc64nvme_from_base64, crc64nvme_to_base64};
 use mountpoint_s3_client::error::{ObjectClientError, PutObjectError};
 use mountpoint_s3_client::types::{
-    ChecksumAlgorithm, PutObjectParams, PutObjectResult, PutObjectTrailingChecksums, UploadChecksum, UploadReview,
+    ChecksumAlgorithm, FullObjectChecksumHandle, PutObjectParams, PutObjectResult, PutObjectTrailingChecksums,
+    UploadChecksum, UploadReview,
 };
 use mountpoint_s3_client::{ObjectClient, PutObjectRequest};
 use tracing::{error, trace};
@@ -27,6 +28,10 @@ pub struct UploadRequest<Client: ObjectClient> {
     key: String,
     next_request_offset: u64,
     hasher: ChecksumHasher,
+    /// Set when the upload uses S3 full-object checksum mode (e.g. CRC64NVME).
+    /// We populate it with the final base64 checksum before invoking `review_and_complete`,
+    /// and the CRT reads it just before issuing `CompleteMultipartUpload`.
+    full_object_checksum_handle: Option<FullObjectChecksumHandle>,
     maximum_upload_size: usize,
     sse: ServerSideEncryption,
 }
@@ -52,11 +57,22 @@ where
     ) -> Result<Self, UploadError<Client::ClientError>> {
         let mut put_object_params = PutObjectParams::new();
 
-        match &params.default_checksum_algorithm {
-            Some(algorithm @ (ChecksumAlgorithm::Crc32c | ChecksumAlgorithm::Crc64nvme)) => {
+        let full_object_checksum_handle = match &params.default_checksum_algorithm {
+            Some(ChecksumAlgorithm::Crc32c) => {
                 put_object_params = put_object_params
                     .trailing_checksums(PutObjectTrailingChecksums::Enabled)
-                    .checksum_algorithm(algorithm.clone());
+                    .checksum_algorithm(ChecksumAlgorithm::Crc32c);
+                None
+            }
+            Some(ChecksumAlgorithm::Crc64nvme) => {
+                // S3 requires FULL_OBJECT for CRC64NVME on multipart uploads. Set up a handle that
+                // we'll populate with the final CRC64NVME just before `review_and_complete`.
+                let handle = FullObjectChecksumHandle::new();
+                put_object_params = put_object_params
+                    .trailing_checksums(PutObjectTrailingChecksums::Enabled)
+                    .checksum_algorithm(ChecksumAlgorithm::Crc64nvme)
+                    .full_object_checksum(handle.clone());
+                Some(handle)
             }
             Some(unsupported) => {
                 unimplemented!("checksum algorithm not supported: {:?}", unsupported);
@@ -66,8 +82,9 @@ where
                 put_object_params = put_object_params
                     .trailing_checksums(PutObjectTrailingChecksums::ReviewOnly)
                     .checksum_algorithm(ChecksumAlgorithm::Crc32c);
+                None
             }
-        }
+        };
         let hasher_algorithm = put_object_params.checksum_algorithm.clone();
         let hasher = ChecksumHasher::new(&Some(hasher_algorithm))
             .expect("CRC32C/CRC64NVME hashers are infallible to construct");
@@ -100,6 +117,7 @@ where
             key: params.key,
             next_request_offset: 0,
             hasher,
+            full_object_checksum_handle,
             maximum_upload_size,
             sse: params.server_side_encryption,
         })
@@ -144,6 +162,13 @@ where
             .finalize()
             .expect("CRC32C/CRC64NVME hasher finalization is infallible")
             .expect("UploadRequest always uses a non-empty hasher");
+        // For full-object mode (CRC64NVME on multipart), give the CRT the final base64 checksum
+        // before it starts assembling the CompleteMultipartUpload request.
+        if let Some(handle) = &self.full_object_checksum_handle {
+            if let UploadChecksum::Crc64nvme(crc) = &checksum {
+                handle.set(crc64nvme_to_base64(crc).into_bytes());
+            }
+        }
         let result = self
             .request
             .into_inner()
