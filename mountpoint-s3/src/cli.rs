@@ -953,4 +953,37 @@ mod tests {
         let filesystem_config = cli_args.filesystem_config(ServerSideEncryption::default(), S3Personality::Standard);
         assert_eq!(filesystem_config.content_type_detection, ContentTypeDetection::Auto);
     }
+
+    #[test_case("crc32c", S3Personality::Standard, Some(ChecksumAlgorithm::Crc32c); "crc32c flag")]
+    #[test_case("crc64nvme", S3Personality::Standard, Some(ChecksumAlgorithm::Crc64nvme); "crc64nvme flag")]
+    #[test_case("off", S3Personality::Standard, None; "off flag")]
+    #[test_case("crc64nvme", S3Personality::Outposts, Some(ChecksumAlgorithm::Crc64nvme); "explicit flag overrides personality")]
+    fn parse_upload_checksums_flag(flag_value: &str, personality: S3Personality, expected: Option<ChecksumAlgorithm>) {
+        let cli_args = CliArgs::try_parse_from([
+            "mount-s3",
+            "bucket",
+            "test/location",
+            "--upload-checksums",
+            flag_value,
+        ])
+        .expect("--upload-checksums should parse");
+        let filesystem_config = cli_args.filesystem_config(ServerSideEncryption::default(), personality);
+        assert_eq!(filesystem_config.upload_checksum_algorithm, expected);
+    }
+
+    #[test_case(S3Personality::Standard, Some(ChecksumAlgorithm::Crc32c); "standard defaults to crc32c")]
+    #[test_case(S3Personality::ExpressOneZone, Some(ChecksumAlgorithm::Crc32c); "express defaults to crc32c")]
+    #[test_case(S3Personality::Outposts, None; "outposts disables upload checksums by default")]
+    fn upload_checksums_default(personality: S3Personality, expected: Option<ChecksumAlgorithm>) {
+        let cli_args = CliArgs::try_parse_from(["mount-s3", "bucket", "test/location"])
+            .expect("CliArgs without --upload-checksums should parse");
+        let filesystem_config = cli_args.filesystem_config(ServerSideEncryption::default(), personality);
+        assert_eq!(filesystem_config.upload_checksum_algorithm, expected);
+    }
+
+    #[test]
+    fn parse_upload_checksums_rejects_unknown_value() {
+        let result = CliArgs::try_parse_from(["mount-s3", "bucket", "test/location", "--upload-checksums", "md5"]);
+        assert!(result.is_err(), "unsupported checksum algorithm should be rejected");
+    }
 }

@@ -49,8 +49,8 @@ impl S3CrtClient {
             )?;
 
             let checksum_config = match params.trailing_checksums {
-                PutObjectTrailingChecksums::Enabled => Some(ChecksumConfig::trailing_crc32c()),
-                PutObjectTrailingChecksums::ReviewOnly => Some(ChecksumConfig::upload_review_crc32c()),
+                PutObjectTrailingChecksums::Enabled => Some(ChecksumConfig::trailing(&params.checksum_algorithm)),
+                PutObjectTrailingChecksums::ReviewOnly => Some(ChecksumConfig::upload_review(&params.checksum_algorithm)),
                 PutObjectTrailingChecksums::Disabled => None,
             };
             message.set_checksum_config(checksum_config);

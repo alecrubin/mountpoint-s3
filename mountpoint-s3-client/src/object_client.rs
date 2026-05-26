@@ -547,11 +547,14 @@ pub enum RenameObjectError {
 pub type ObjectMetadata = HashMap<String, String>;
 
 /// Parameters to a [`put_object`](ObjectClient::put_object) request
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PutObjectParams {
-    /// Enable Crc32c trailing checksums.
+    /// Whether to compute and/or send trailing checksums for the upload.
     pub trailing_checksums: PutObjectTrailingChecksums,
+    /// Checksum algorithm used when `trailing_checksums` is `Enabled` or `ReviewOnly`.
+    /// Ignored when `trailing_checksums` is `Disabled`.
+    pub checksum_algorithm: ChecksumAlgorithm,
     /// Storage class to be used when creating new S3 object
     pub storage_class: Option<String>,
     /// The server-side encryption algorithm to be used for this object in Amazon S3 (for example, AES256, aws:kms, aws:kms:dsse)
@@ -568,15 +571,36 @@ pub struct PutObjectParams {
     pub custom_id: Option<u64>,
 }
 
+impl Default for PutObjectParams {
+    fn default() -> Self {
+        Self {
+            trailing_checksums: PutObjectTrailingChecksums::default(),
+            checksum_algorithm: ChecksumAlgorithm::Crc32c,
+            storage_class: None,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            custom_headers: Vec::new(),
+            object_metadata: ObjectMetadata::new(),
+            custom_id: None,
+        }
+    }
+}
+
 impl PutObjectParams {
     /// Create a default [PutObjectParams].
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set Crc32c trailing checksums.
+    /// Set trailing checksum mode.
     pub fn trailing_checksums(mut self, value: PutObjectTrailingChecksums) -> Self {
         self.trailing_checksums = value;
+        self
+    }
+
+    /// Set the checksum algorithm used for trailing checksums.
+    pub fn checksum_algorithm(mut self, value: ChecksumAlgorithm) -> Self {
+        self.checksum_algorithm = value;
         self
     }
 

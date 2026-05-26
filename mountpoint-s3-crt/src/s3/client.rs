@@ -1645,23 +1645,23 @@ pub struct ChecksumConfig {
 }
 
 impl ChecksumConfig {
-    /// Create a [ChecksumConfig] enabling Crc32c trailing checksums in PUT requests.
-    pub fn trailing_crc32c() -> Self {
+    /// Create a [ChecksumConfig] enabling trailing checksums of the given algorithm in PUT requests.
+    pub fn trailing(algorithm: &ChecksumAlgorithm) -> Self {
         Self {
             inner: aws_s3_checksum_config {
                 location: aws_s3_checksum_location::AWS_SCL_TRAILER,
-                checksum_algorithm: aws_s3_checksum_algorithm::AWS_SCA_CRC32C,
+                checksum_algorithm: algorithm.to_aws_s3_checksum_algorithm(),
                 ..Default::default()
             },
         }
     }
 
-    /// Create a [ChecksumConfig] enabling Crc32c trailing checksums only for upload review.
-    pub fn upload_review_crc32c() -> Self {
+    /// Create a [ChecksumConfig] enabling trailing checksums of the given algorithm for upload review only.
+    pub fn upload_review(algorithm: &ChecksumAlgorithm) -> Self {
         Self {
             inner: aws_s3_checksum_config {
                 location: aws_s3_checksum_location::AWS_SCL_NONE,
-                checksum_algorithm: aws_s3_checksum_algorithm::AWS_SCA_CRC32C,
+                checksum_algorithm: algorithm.to_aws_s3_checksum_algorithm(),
                 ..Default::default()
             },
         }
@@ -1704,6 +1704,19 @@ impl ChecksumAlgorithm {
             aws_s3_checksum_algorithm::AWS_SCA_SHA1 => Some(ChecksumAlgorithm::Sha1),
             aws_s3_checksum_algorithm::AWS_SCA_SHA256 => Some(ChecksumAlgorithm::Sha256),
             _ => unreachable!("unknown aws_s3_checksum_algorithm"),
+        }
+    }
+
+    fn to_aws_s3_checksum_algorithm(&self) -> aws_s3_checksum_algorithm {
+        match self {
+            ChecksumAlgorithm::Crc64nvme => aws_s3_checksum_algorithm::AWS_SCA_CRC64NVME,
+            ChecksumAlgorithm::Crc32c => aws_s3_checksum_algorithm::AWS_SCA_CRC32C,
+            ChecksumAlgorithm::Crc32 => aws_s3_checksum_algorithm::AWS_SCA_CRC32,
+            ChecksumAlgorithm::Sha1 => aws_s3_checksum_algorithm::AWS_SCA_SHA1,
+            ChecksumAlgorithm::Sha256 => aws_s3_checksum_algorithm::AWS_SCA_SHA256,
+            ChecksumAlgorithm::Unknown(algorithm) => {
+                panic!("cannot send unknown checksum algorithm to CRT: {algorithm}")
+            }
         }
     }
 }
