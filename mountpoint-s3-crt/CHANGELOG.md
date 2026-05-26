@@ -1,5 +1,15 @@
 ## Unreleased
 
+### Breaking changes
+
+* `ChecksumConfig::trailing_crc32c` and `upload_review_crc32c` are removed. The replacements `ChecksumConfig::trailing(algorithm)` and `ChecksumConfig::upload_review(algorithm)` accept any `ChecksumAlgorithm`.
+* `ChecksumConfig` no longer derives `Clone`. It now owns a callback registration whose lifetime can't be safely duplicated.
+
+### Other changes
+
+* Add `ChecksumConfig::with_full_object_handle` and `FullObjectChecksumHandle` for S3's full-object checksum mode on multipart uploads. The handle carries an `Arc<OnceLock>` the caller populates with the final base64 checksum; the CRT reads it via its `full_object_checksum_callback` when assembling `CompleteMultipartUpload`.
+* Add `crc64nvme::combine` wrapping `aws_checksums_crc64nvme_combine`.
+
 ## v0.14.0 (April 28, 2026)
 
 * Expose the originating `MetaRequest` in `MemoryPool` trait methods. ([#1812](https://github.com/awslabs/mountpoint-s3/pull/1812))

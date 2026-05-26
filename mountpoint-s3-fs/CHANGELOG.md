@@ -1,5 +1,12 @@
 ## Unreleased
 
+### Breaking changes
+
+* Replace `S3FilesystemConfig::use_upload_checksums: bool` with `S3FilesystemConfig::upload_checksum_algorithm: Option<ChecksumAlgorithm>`. `None` disables upload checksums; `Some(algorithm)` enables them with that algorithm. The default is `Some(ChecksumAlgorithm::Crc32c)`, matching previous behavior.
+
+### Other changes
+
+* `UploadRequest` now supports CRC64NVME on the atomic (single-PutObject) upload path, in addition to the existing CRC32C support. CRC64NVME uses S3's `FULL_OBJECT` checksum mode on multipart uploads (the only mode S3 supports for CRC64NVME).
 * Fix memory limiter ignoring container cgroup memory limits, which could cause out-of-memory issues in memory-constrained containers. ([#1806](https://github.com/awslabs/mountpoint-s3/pull/1806))
 * Add `S3FilesystemConfig::content_type_detection` option to configure automatic content type inference for new uploads. When set to `ContentTypeDetection::Auto`, Mountpoint will infer the `Content-Type` of new objects based on their file extension. ([#1790](https://github.com/awslabs/mountpoint-s3/pull/1790))
 * Add additional debug information to FUSE operation logs including the ID of the process triggering the file system operation. Some FUSE operations have a new log printed where they didn't already have one. ([#1718](https://github.com/awslabs/mountpoint-s3/pull/1718))

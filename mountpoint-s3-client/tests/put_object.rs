@@ -16,8 +16,8 @@ use mountpoint_s3_client::checksums::{crc32c, crc32c_to_base64};
 use mountpoint_s3_client::config::S3ClientConfig;
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::{
-    ChecksumAlgorithm, GetObjectParams, HeadObjectParams, ObjectClientResult, PutObjectParams, PutObjectResult,
-    PutObjectTrailingChecksums,
+    ChecksumAlgorithm, GetObjectParams, HeadObjectParams, ObjectClientResult, PutObjectChecksumMode, PutObjectParams,
+    PutObjectResult,
 };
 use mountpoint_s3_client::{ObjectClient, PutObjectRequest, S3CrtClient, S3RequestError};
 
@@ -339,11 +339,23 @@ async fn test_put_object_initiate_failure() {
     assert_eq!(uploads_in_progress, 0);
 }
 
-#[test_case(PutObjectTrailingChecksums::Enabled; "enabled")]
-#[test_case(PutObjectTrailingChecksums::ReviewOnly; "review only")]
-#[test_case(PutObjectTrailingChecksums::Disabled; "disabled")]
+fn composite_crc32c() -> PutObjectChecksumMode {
+    PutObjectChecksumMode::Composite {
+        algorithm: ChecksumAlgorithm::Crc32c,
+    }
+}
+
+fn review_only_crc32c() -> PutObjectChecksumMode {
+    PutObjectChecksumMode::ReviewOnly {
+        algorithm: ChecksumAlgorithm::Crc32c,
+    }
+}
+
+#[test_case(composite_crc32c(), true; "composite crc32c")]
+#[test_case(review_only_crc32c(), false; "review only crc32c")]
+#[test_case(PutObjectChecksumMode::Disabled, false; "disabled")]
 #[tokio::test]
-async fn test_put_checksums(trailing_checksums: PutObjectTrailingChecksums) {
+async fn test_put_checksums(mode: PutObjectChecksumMode, persists_to_object: bool) {
     const PART_SIZE: usize = 5 * 1024 * 1024;
     let (bucket, prefix) = get_test_bucket_and_prefix("test_put_checksums");
     let client = get_test_client_with_config(
@@ -357,7 +369,8 @@ async fn test_put_checksums(trailing_checksums: PutObjectTrailingChecksums) {
     let mut contents = vec![0u8; PART_SIZE * 2];
     rng.fill(&mut contents[..]);
 
-    let params = PutObjectParams::new().trailing_checksums(trailing_checksums);
+    let expects_review_algorithm = !matches!(mode, PutObjectChecksumMode::Disabled);
+    let params = PutObjectParams::new().checksums(mode);
     let mut request = client
         .put_object(&bucket, &key, &params)
         .await
@@ -367,11 +380,11 @@ async fn test_put_checksums(trailing_checksums: PutObjectTrailingChecksums) {
     request
         .review_and_complete(move |review| {
             let parts = review.parts;
-            if trailing_checksums == PutObjectTrailingChecksums::Disabled {
+            if expects_review_algorithm {
+                assert_eq!(review.checksum_algorithm, Some(ChecksumAlgorithm::Crc32c));
+            } else {
                 assert!(review.checksum_algorithm.is_none());
                 assert!(parts.iter().all(|p| p.checksum.is_none()));
-            } else {
-                assert_eq!(review.checksum_algorithm, Some(ChecksumAlgorithm::Crc32c));
             }
             true
         })
@@ -389,7 +402,7 @@ async fn test_put_checksums(trailing_checksums: PutObjectTrailingChecksums) {
         .unwrap();
     let parts = attributes.object_parts().unwrap().parts();
 
-    if trailing_checksums == PutObjectTrailingChecksums::Enabled {
+    if persists_to_object {
         let checksums: Vec<_> = parts.iter().map(|p| p.checksum_crc32_c().unwrap()).collect();
         let expected_checksums: Vec<_> = contents.chunks(PART_SIZE).map(crc32c::checksum).collect();
 
@@ -473,7 +486,7 @@ async fn test_put_review(pass_review: bool) {
     let mut contents = vec![0u8; PART_SIZE * 2];
     rng.fill(&mut contents[..]);
 
-    let params = PutObjectParams::new().trailing_checksums(PutObjectTrailingChecksums::Enabled);
+    let params = PutObjectParams::new().checksums(composite_crc32c());
     let mut request = client
         .put_object(&bucket, &key, &params)
         .await

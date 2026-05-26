@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Breaking changes
+
+* Replace `PutObjectParams::trailing_checksums`, `checksum_algorithm`, and `full_object_checksum` with a single `PutObjectChecksumMode` enum on `PutObjectParams::checksums`. The variants (`Disabled`, `ReviewOnly { algorithm }`, `Composite { algorithm }`, `FullObject { algorithm, handle }`) make invalid combinations unrepresentable (e.g. composite CRC64NVME, or full-object mode without a handle). The `PutObjectTrailingChecksums` enum is removed.
+* Add `FullObjectChecksumHandle` and re-export it from `types`. It carries an `Arc<OnceLock<Vec<u8>>>` the caller populates with the final base64-encoded checksum before the upload completes.
+
+### Other changes
+
+* The mock client now mirrors S3's rejection of composite CRC64NVME and of full-object uploads whose handle wasn't populated before `complete()`.
+
 ## v0.20.0 (April 28, 2026)
 
 * Add S3 client error covering failures to create S3 Express session. ([#1793](https://github.com/awslabs/mountpoint-s3/pull/1793))

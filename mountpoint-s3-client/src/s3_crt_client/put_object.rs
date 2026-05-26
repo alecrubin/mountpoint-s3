@@ -17,10 +17,8 @@ use crate::object_client::{
     ObjectClientResult, PutObjectError, PutObjectParams, PutObjectRequest, PutObjectResult, PutObjectSingleParams,
 };
 
-use super::{
-    ETag, PutObjectTrailingChecksums, S3CrtClient, S3Message, S3MetaRequest, S3Operation, S3RequestError,
-    emit_throughput_metric,
-};
+use super::{ETag, S3CrtClient, S3Message, S3MetaRequest, S3Operation, S3RequestError, emit_throughput_metric};
+use crate::object_client::PutObjectChecksumMode;
 
 const ETAG_HEADER_NAME: &str = "ETag";
 const SSE_TYPE_HEADER_NAME: &str = "x-amz-server-side-encryption";
@@ -48,15 +46,13 @@ impl S3CrtClient {
                 params.ssekms_key_id.as_deref(),
             )?;
 
-            let checksum_config = match (params.trailing_checksums, params.full_object_checksum.clone()) {
-                (PutObjectTrailingChecksums::Disabled, _) => None,
-                (PutObjectTrailingChecksums::Enabled, Some(handle)) => Some(
-                    ChecksumConfig::with_full_object_handle(&params.checksum_algorithm, handle),
+            let checksum_config = match &params.checksums {
+                PutObjectChecksumMode::Disabled => None,
+                PutObjectChecksumMode::ReviewOnly { algorithm } => Some(ChecksumConfig::upload_review(algorithm)),
+                PutObjectChecksumMode::Composite { algorithm } => Some(ChecksumConfig::trailing(algorithm)),
+                PutObjectChecksumMode::FullObject { algorithm, handle } => Some(
+                    ChecksumConfig::with_full_object_handle(algorithm, handle.clone()),
                 ),
-                (PutObjectTrailingChecksums::Enabled, None) => Some(ChecksumConfig::trailing(&params.checksum_algorithm)),
-                (PutObjectTrailingChecksums::ReviewOnly, _) => {
-                    Some(ChecksumConfig::upload_review(&params.checksum_algorithm))
-                }
             };
             message.set_checksum_config(checksum_config);
 

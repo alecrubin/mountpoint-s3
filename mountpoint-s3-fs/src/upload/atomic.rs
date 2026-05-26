@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use mountpoint_s3_client::checksums::{Crc32c, crc32c_from_base64, crc64nvme, crc64nvme_from_base64, crc64nvme_to_base64};
 use mountpoint_s3_client::error::{ObjectClientError, PutObjectError};
 use mountpoint_s3_client::types::{
-    ChecksumAlgorithm, FullObjectChecksumHandle, PutObjectParams, PutObjectResult, PutObjectTrailingChecksums,
+    ChecksumAlgorithm, FullObjectChecksumHandle, PutObjectChecksumMode, PutObjectParams, PutObjectResult,
     UploadChecksum, UploadReview,
 };
 use mountpoint_s3_client::{ObjectClient, PutObjectRequest};
@@ -55,39 +55,45 @@ where
         client: Client,
         params: UploadRequestParams,
     ) -> Result<Self, UploadError<Client::ClientError>> {
-        let mut put_object_params = PutObjectParams::new();
-
-        let full_object_checksum_handle = match &params.default_checksum_algorithm {
-            Some(ChecksumAlgorithm::Crc32c) => {
-                put_object_params = put_object_params
-                    .trailing_checksums(PutObjectTrailingChecksums::Enabled)
-                    .checksum_algorithm(ChecksumAlgorithm::Crc32c);
-                None
-            }
-            Some(ChecksumAlgorithm::Crc64nvme) => {
-                // S3 requires FULL_OBJECT for CRC64NVME on multipart uploads. Set up a handle that
-                // we'll populate with the final CRC64NVME just before `review_and_complete`.
-                let handle = FullObjectChecksumHandle::new();
-                put_object_params = put_object_params
-                    .trailing_checksums(PutObjectTrailingChecksums::Enabled)
-                    .checksum_algorithm(ChecksumAlgorithm::Crc64nvme)
-                    .full_object_checksum(handle.clone());
-                Some(handle)
-            }
-            Some(unsupported) => {
-                unimplemented!("checksum algorithm not supported: {:?}", unsupported);
-            }
-            None => {
-                // Default to CRC32C upload review so the client can verify what S3 received.
-                put_object_params = put_object_params
-                    .trailing_checksums(PutObjectTrailingChecksums::ReviewOnly)
-                    .checksum_algorithm(ChecksumAlgorithm::Crc32c);
-                None
-            }
-        };
-        let hasher_algorithm = put_object_params.checksum_algorithm.clone();
+        // Construct the upload's checksum mode and a matching hasher in one place so they can't
+        // drift. CRC64NVME requires S3's FULL_OBJECT mode on multipart uploads; CRC32C uses
+        // composite. When no algorithm is requested we still compute CRC32C for upload review
+        // so the client can verify what S3 received.
+        let (checksum_mode, hasher_algorithm, full_object_checksum_handle) =
+            match &params.default_checksum_algorithm {
+                Some(ChecksumAlgorithm::Crc32c) => (
+                    PutObjectChecksumMode::Composite {
+                        algorithm: ChecksumAlgorithm::Crc32c,
+                    },
+                    ChecksumAlgorithm::Crc32c,
+                    None,
+                ),
+                Some(ChecksumAlgorithm::Crc64nvme) => {
+                    let handle = FullObjectChecksumHandle::new();
+                    (
+                        PutObjectChecksumMode::FullObject {
+                            algorithm: ChecksumAlgorithm::Crc64nvme,
+                            handle: handle.clone(),
+                        },
+                        ChecksumAlgorithm::Crc64nvme,
+                        Some(handle),
+                    )
+                }
+                Some(unsupported) => {
+                    unimplemented!("checksum algorithm not supported: {:?}", unsupported);
+                }
+                None => (
+                    PutObjectChecksumMode::ReviewOnly {
+                        algorithm: ChecksumAlgorithm::Crc32c,
+                    },
+                    ChecksumAlgorithm::Crc32c,
+                    None,
+                ),
+            };
         let hasher = ChecksumHasher::new(&Some(hasher_algorithm))
             .expect("CRC32C/CRC64NVME hashers are infallible to construct");
+
+        let mut put_object_params = PutObjectParams::new().checksums(checksum_mode);
 
         if let Some(storage_class) = &params.storage_class {
             put_object_params = put_object_params.storage_class(storage_class.clone());
@@ -163,11 +169,16 @@ where
             .expect("CRC32C/CRC64NVME hasher finalization is infallible")
             .expect("UploadRequest always uses a non-empty hasher");
         // For full-object mode (CRC64NVME on multipart), give the CRT the final base64 checksum
-        // before it starts assembling the CompleteMultipartUpload request.
+        // before it starts assembling the CompleteMultipartUpload request. The handle is set up
+        // in `new()` only for CRC64NVME, so its presence implies the hasher produced a
+        // CRC64NVME value — enforce that invariant rather than silently no-op'ing on drift.
         if let Some(handle) = &self.full_object_checksum_handle {
-            if let UploadChecksum::Crc64nvme(crc) = &checksum {
-                handle.set(crc64nvme_to_base64(crc).into_bytes());
-            }
+            let UploadChecksum::Crc64nvme(crc) = &checksum else {
+                unreachable!(
+                    "full-object handle is constructed only for CRC64NVME but hasher produced {checksum:?}"
+                );
+            };
+            handle.set(crc64nvme_to_base64(crc).into_bytes());
         }
         let result = self
             .request

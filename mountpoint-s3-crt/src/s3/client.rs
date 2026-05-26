@@ -1642,25 +1642,30 @@ pub fn init_signing_config(
 pub struct ChecksumConfig {
     /// The struct we can pass into the CRT's functions.
     inner: aws_s3_checksum_config,
-    /// State kept alive for the duration of the request when full-object mode is in use.
-    /// The CRT reads `inner.user_data` as a pointer to the `OnceLock<Vec<u8>>` inside this Arc,
-    /// so the Arc must outlive `inner`. Not read directly — its address is what matters.
-    #[allow(dead_code)]
+    /// Keeps the `Arc<OnceLock<...>>` referenced by `inner.user_data` alive for the request's
+    /// lifetime. Never read directly — its sole purpose is to extend the `OnceLock`'s lifetime
+    /// past `Self::new`. The CRT calls `full_object_checksum_callback` from an internal thread
+    /// at some point before issuing `CompleteMultipartUpload`, and only releases the meta
+    /// request — and therefore this struct — via its `shutdown_callback`, which fires *after*
+    /// every other callback. So as long as this field stays alive with the surrounding
+    /// `MetaRequestOptionsInner`, the raw pointer in `inner.user_data` is valid for the
+    /// duration of every possible callback invocation.
+    #[allow(dead_code)] // intentional: kept to extend `OnceLock` lifetime, not read.
     full_object_state: Option<Arc<OnceLock<Vec<u8>>>>,
 }
 
 /// Handle the caller uses to provide the full-object checksum for a multipart upload after
 /// streaming finishes but before `CompleteMultipartUpload` is sent.
 ///
-/// Created via [`ChecksumConfig::with_full_object_handle`] / [`ChecksumConfig::trailing_with_full_object`].
+/// Cloning yields another handle pointing at the same shared state; calling [`Self::set`] on
+/// any clone populates the value seen by the CRT.
 #[derive(Debug, Clone)]
 pub struct FullObjectChecksumHandle {
     state: Arc<OnceLock<Vec<u8>>>,
 }
 
 impl FullObjectChecksumHandle {
-    /// Create a fresh, unpopulated handle. The caller can clone this handle as needed; setting
-    /// the checksum once populates the value visible to all clones.
+    /// Create a fresh, unpopulated handle.
     pub fn new() -> Self {
         Self {
             state: Arc::new(OnceLock::new()),
@@ -1673,10 +1678,15 @@ impl FullObjectChecksumHandle {
         let _ = self.state.set(base64);
     }
 
-    /// Read the base64 value the caller has written, if any. Primarily for non-CRT consumers
-    /// (e.g. the mock client) that need to inspect what would be sent to S3.
+    /// Read the base64 value the caller has written, if any.
+    ///
+    /// **Not** the production code path — the CRT reads the value via its own callback. This
+    /// accessor exists so non-CRT consumers (notably the mock client and unit tests) can
+    /// inspect what would be sent to S3.
     pub fn peek_base64(&self) -> Option<String> {
-        self.state.get().and_then(|bytes| std::str::from_utf8(bytes).ok().map(str::to_owned))
+        self.state
+            .get()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok().map(str::to_owned))
     }
 }
 
@@ -1711,30 +1721,15 @@ impl ChecksumConfig {
         }
     }
 
-    /// Create a [ChecksumConfig] that uses S3's "full-object" checksum mode for multipart uploads.
-    /// Per-part trailing checksums are still sent (for the CRT's upload review), but the object-level
-    /// checksum sent on `CompleteMultipartUpload` is the value the caller writes into the returned
-    /// [`FullObjectChecksumHandle`].
-    pub fn trailing_with_full_object(algorithm: &ChecksumAlgorithm) -> (Self, FullObjectChecksumHandle) {
-        let state = Arc::new(OnceLock::new());
-        let user_data = Arc::as_ptr(&state) as *mut libc::c_void;
-        let config = Self {
-            inner: aws_s3_checksum_config {
-                location: aws_s3_checksum_location::AWS_SCL_TRAILER,
-                checksum_algorithm: algorithm.to_aws_s3_checksum_algorithm(),
-                full_object_checksum_callback: Some(full_object_checksum_shim),
-                user_data,
-                ..Default::default()
-            },
-            full_object_state: Some(Arc::clone(&state)),
-        };
-        let handle = FullObjectChecksumHandle { state };
-        (config, handle)
-    }
-
-    /// Variant of [`Self::trailing_with_full_object`] that reuses an existing handle.
+    /// Create a [ChecksumConfig] that uses S3's "full-object" checksum mode for multipart uploads,
+    /// reusing the caller's [`FullObjectChecksumHandle`]. Per-part trailing checksums are still
+    /// sent (for the CRT's upload review), but the object-level checksum sent on
+    /// `CompleteMultipartUpload` is the value the caller writes into `handle`.
     pub fn with_full_object_handle(algorithm: &ChecksumAlgorithm, handle: FullObjectChecksumHandle) -> Self {
         let state = handle.state;
+        // SAFETY: `Arc::as_ptr` returns a stable address into the Arc allocation. We keep one
+        // strong reference alive in `full_object_state` below, so the allocation outlives every
+        // possible CRT callback invocation. See the field comment on `full_object_state`.
         let user_data = Arc::as_ptr(&state) as *mut libc::c_void;
         Self {
             inner: aws_s3_checksum_config {
@@ -1754,6 +1749,15 @@ impl ChecksumConfig {
     }
 }
 
+/// Compute the `aws_string*` the CRT expects from a full-object checksum callback. Pulled out
+/// of the FFI shim so it can be unit-tested without constructing a fake `aws_s3_meta_request`.
+///
+/// Returns `None` when the caller didn't populate the handle; the FFI shim translates that to
+/// a NULL return + raised CRT error.
+fn full_object_checksum_value(state: &OnceLock<Vec<u8>>) -> Option<&[u8]> {
+    state.get().map(Vec::as_slice)
+}
+
 /// SAFETY: Don't call this function directly, only called by the CRT as the full-object checksum
 /// callback. `user_data` must be the `Arc::as_ptr` of an `OnceLock<Vec<u8>>` kept alive by the
 /// owning [`ChecksumConfig`].
@@ -1763,13 +1767,80 @@ unsafe extern "C" fn full_object_checksum_shim(
 ) -> *mut aws_string {
     // SAFETY: see function-level safety contract.
     let state = unsafe { &*(user_data as *const OnceLock<Vec<u8>>) };
-    let Some(bytes) = state.get() else {
-        // Caller didn't populate the handle in time. Returning NULL signals an error to the CRT.
+    let Some(bytes) = full_object_checksum_value(state) else {
+        // Caller didn't populate the handle in time. Raise a CRT error so the surrounding
+        // request fails with something the user can see, then signal failure with NULL. Without
+        // the `aws_raise_error` call the CRT's caller would read whatever stale error happened
+        // to be in thread-local storage.
+        // SAFETY: aws_raise_error is a pure setter on TLS error state.
+        unsafe {
+            aws_raise_error(aws_common_error::AWS_ERROR_UNKNOWN as i32);
+        }
         return std::ptr::null_mut();
     };
-    // SAFETY: aws_default_allocator returns a non-null allocator; aws_string_new_from_array copies
-    // the bytes and returns a heap-allocated aws_string for the CRT to consume and destroy.
+    // SAFETY: `aws_default_allocator` returns a process-global, stable allocator. The CRT
+    // releases the returned string via `aws_string_destroy`, which uses the allocator stored in
+    // the `aws_string` header — so using the default allocator here is sound regardless of which
+    // allocator the surrounding meta request is using.
     unsafe { aws_string_new_from_array(aws_default_allocator(), bytes.as_ptr(), bytes.len()) }
+}
+
+#[cfg(test)]
+mod checksum_config_tests {
+    use super::*;
+
+    /// `full_object_checksum_value` is the pure-Rust core of `full_object_checksum_shim`.
+    /// Exercising it directly is the closest we can get to testing the FFI shim without
+    /// constructing a fake `aws_s3_meta_request`.
+    #[test]
+    fn full_object_checksum_value_returns_set_bytes() {
+        let state = OnceLock::new();
+        assert!(full_object_checksum_value(&state).is_none());
+
+        state.set(b"abc=".to_vec()).unwrap();
+        assert_eq!(full_object_checksum_value(&state), Some(b"abc=".as_slice()));
+    }
+
+    #[test]
+    fn full_object_handle_set_and_peek_roundtrip() {
+        let handle = FullObjectChecksumHandle::new();
+        assert!(handle.peek_base64().is_none());
+        handle.set(b"AAECAw==".to_vec());
+        assert_eq!(handle.peek_base64().as_deref(), Some("AAECAw=="));
+        // set is idempotent: a second call has no effect.
+        handle.set(b"OTHER".to_vec());
+        assert_eq!(handle.peek_base64().as_deref(), Some("AAECAw=="));
+    }
+
+    #[test]
+    fn cloned_handles_share_state() {
+        let a = FullObjectChecksumHandle::new();
+        let b = a.clone();
+        a.set(b"shared".to_vec());
+        assert_eq!(b.peek_base64().as_deref(), Some("shared"));
+    }
+
+    /// Smoke-test the FFI lifetime contract: keep a reference to the inner OnceLock alive
+    /// through the same path the shim uses, and confirm a value written through the handle is
+    /// readable through the raw pointer.
+    #[test]
+    fn user_data_pointer_resolves_to_handle_state() {
+        let (_config, handle) = {
+            let config = ChecksumConfig::with_full_object_handle(
+                &ChecksumAlgorithm::Crc64nvme,
+                FullObjectChecksumHandle::new(),
+            );
+            let handle = FullObjectChecksumHandle {
+                state: config.full_object_state.as_ref().unwrap().clone(),
+            };
+            (config, handle)
+        };
+        handle.set(b"VALUE".to_vec());
+        let raw = Arc::as_ptr(&handle.state) as *const OnceLock<Vec<u8>>;
+        // SAFETY: `handle` is alive on the stack, keeping the Arc allocation alive.
+        let state = unsafe { &*raw };
+        assert_eq!(full_object_checksum_value(state), Some(b"VALUE".as_slice()));
+    }
 }
 
 /// Checksum algorithm.

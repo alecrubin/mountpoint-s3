@@ -93,8 +93,8 @@ pub mod types {
         Checksum, ChecksumAlgorithm, ChecksumMode, ClientBackpressureHandle, CopyObjectParams, CopyObjectResult,
         DeleteObjectResult, ETag, FullObjectChecksumHandle, GetBodyPart, GetObjectAttributesParts,
         GetObjectAttributesResult, GetObjectParams, GetObjectResponse, HeadObjectParams, HeadObjectResult,
-        ListObjectsResult, ObjectAttribute, ObjectClientResult, ObjectInfo, ObjectPart, PutObjectParams,
-        PutObjectResult, PutObjectSingleParams, PutObjectTrailingChecksums, RenameObjectParams, RenameObjectResult,
+        ListObjectsResult, ObjectAttribute, ObjectClientResult, ObjectInfo, ObjectPart, PutObjectChecksumMode,
+        PutObjectParams, PutObjectResult, PutObjectSingleParams, RenameObjectParams, RenameObjectResult,
         RenamePreconditionTypes, RestoreStatus, UploadChecksum, UploadReview, UploadReviewPart,
     };
 }
